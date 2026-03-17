@@ -273,7 +273,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/semaine` — Résumé de toute la semaine\n"
         "• `/myslots` — Mes réservations\n\n"
         "📆 *Vue par jour*\n"
-        "• `/aujourd'hui` ou `/aujourd_hui`\n"
+        "• `/aujourd_hui` ou `/auj`\n"
         "• `/demain`\n"
         "• `/lundi` `/mardi` `/mercredi`\n"
         "• `/jeudi` `/vendredi` `/samedi` `/dimanche`\n\n"
@@ -613,7 +613,7 @@ def main():
 
     # Vues par jour
     app.add_handler(CommandHandler(
-        ["aujourd_hui", "aujourdhui", "aujourd'hui", "auj"],
+        ["aujourd_hui", "aujourdhui", "auj"],
         cmd_aujourd_hui
     ))
     app.add_handler(CommandHandler("demain",               cmd_demain))
