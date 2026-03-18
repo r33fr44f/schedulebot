@@ -1,5 +1,5 @@
 """
-ScheduleBot Telegram v4
+ScheduleBot Telegram v3
 ─────────────────────────────────────────────
 ✅ Multi-admins (liste configurable)
 ✅ Réservation membres du groupe uniquement
@@ -639,7 +639,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
 
     log.info(f"✅ ScheduleBot v3 démarré — admins initiaux : {INITIAL_ADMIN_IDS}")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, close_loop=False)
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -657,10 +657,15 @@ def start_health_server():
 
 if __name__ == "__main__":
     import asyncio
-    # Lancer le serveur HTTP dans un thread séparé (pour Render)
+    import time
+
+    # Démarrer le serveur HTTP EN PREMIER et attendre qu il soit prêt
     t = threading.Thread(target=start_health_server, daemon=True)
     t.start()
-    # Lancer le bot
+    time.sleep(2)  # Laisser le temps au serveur HTTP de démarrer
+    log.info("Health server prêt, démarrage du bot...")
+
+    # Lancer le bot ensuite
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
