@@ -658,17 +658,55 @@ def start_health_server():
 if __name__ == "__main__":
     import asyncio
     import time
+    from telegram.error import Conflict as TGConflict
 
-    # Démarrer le serveur HTTP EN PREMIER et attendre qu il soit prêt
+    # Démarrer le serveur HTTP EN PREMIER
     t = threading.Thread(target=start_health_server, daemon=True)
     t.start()
-    time.sleep(2)  # Laisser le temps au serveur HTTP de démarrer
+    time.sleep(2)
     log.info("Health server prêt, démarrage du bot...")
 
-    # Lancer le bot ensuite
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        main()
-    finally:
-        loop.close()
+    MAX_RETRIES = 5
+    retry = 0
+
+    while retry < MAX_RETRIES:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            log.info(f"Tentative de démarrage #{retry + 1}...")
+            main()
+            break  # Sortie propre, on arrête la boucle
+
+        except TGConflict:
+            retry += 1
+            wait = retry * 10  # 10s, 20s, 30s...
+            log.warning(
+                f"Conflit détecté (instance dupliquée). "
+                f"Attente {wait}s avant redémarrage... "
+                f"(tentative {retry}/{MAX_RETRIES})"
+            )
+            try:
+                loop.close()
+            except:
+                pass
+            time.sleep(wait)
+
+        except Exception as e:
+            retry += 1
+            wait = retry * 5
+            log.error(f"Erreur inattendue : {e}. Redémarrage dans {wait}s...")
+            try:
+                loop.close()
+            except:
+                pass
+            time.sleep(wait)
+
+        finally:
+            try:
+                loop.close()
+            except:
+                pass
+
+    if retry >= MAX_RETRIES:
+        log.critical("Nombre maximum de tentatives atteint. Arrêt du bot.")
+        raise SystemExit(1)
