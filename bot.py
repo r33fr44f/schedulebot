@@ -13,6 +13,8 @@ ScheduleBot Telegram v3
 import os
 import json
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -639,8 +641,26 @@ def main():
     log.info(f"✅ ScheduleBot v3 démarré — admins initiaux : {INITIAL_ADMIN_IDS}")
     app.run_polling(drop_pending_updates=True)
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass  # silence les logs HTTP
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    log.info(f"Health check server sur le port {port}")
+    server.serve_forever()
+
 if __name__ == "__main__":
     import asyncio
+    # Lancer le serveur HTTP dans un thread séparé (pour Render)
+    t = threading.Thread(target=start_health_server, daemon=True)
+    t.start()
+    # Lancer le bot
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
