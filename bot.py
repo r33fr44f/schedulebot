@@ -1,5 +1,5 @@
 """
-ScheduleBot Telegram v3
+ScheduleBot Telegram v4
 ─────────────────────────────────────────────
 ✅ Multi-admins (liste configurable)
 ✅ Réservation membres du groupe uniquement
