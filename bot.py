@@ -1,28 +1,43 @@
 """
-ScheduleBot Telegram v3
+ScheduleBot Telegram v3.2
 ─────────────────────────────────────────────
 ✅ Multi-admins (liste configurable)
 ✅ Réservation membres du groupe uniquement
 ✅ Anti-bot
 ✅ Persistance JSON
-✅ Vues par jour : /aujourd'hui /demain /lundi … /dimanche
+✅ Vues par jour : /aujourd_hui /demain /lundi … /dimanche
 ✅ Commandes admin : /new /purge /reset /addadmin /removeadmin /admins
-✅ Commandes membres : /planning /myslots /aujourd'hui /demain /semaine
+✅ Commandes membres : /planning /myslots /demain /semaine
+✅ Protection concurrence JSON (threading.Lock)
+✅ Auto-redémarrage sur erreur Conflict
+✅ màj conccurence et time zone
 """
 
 import os
 import json
 import logging
 import threading
+from threading import Lock
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from pathlib import Path
+import pytz
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 from telegram.error import TelegramError
+
+# ─── Timezone ─────────────────────────────────────────────────────────────────
+TZ = pytz.timezone("Europe/Paris")
+
+def now() -> datetime:
+    """Heure actuelle en heure française (gère heure d été / hiver auto)."""
+    return datetime.now(TZ)
+
+# ─── Lock global (protection concurrence JSON) ───────────────────────────────
+db_lock = Lock()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -47,20 +62,22 @@ log = logging.getLogger(__name__)
 # ─── Persistance ──────────────────────────────────────────────────────────────
 
 def load_data() -> dict:
-    if DATA_FILE.exists():
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            log.error(f"Erreur lecture : {e}")
-    return {}
+    with db_lock:
+        if DATA_FILE.exists():
+            try:
+                with open(DATA_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                log.error(f"Erreur lecture : {e}")
+        return {}
 
 def save_data(db: dict):
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(db, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.error(f"Erreur sauvegarde : {e}")
+    with db_lock:
+        try:
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump(db, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.error(f"Erreur sauvegarde : {e}")
 
 db: dict = load_data()
 
@@ -77,7 +94,8 @@ def get_admin_ids() -> set[int]:
     return stored | INITIAL_ADMIN_IDS
 
 def save_admin_ids(ids: set[int]):
-    db["admin_ids"] = list(ids)
+    with db_lock:
+        db["admin_ids"] = list(ids)
     save_data(db)
 
 # ─── Helpers semaine & créneaux ───────────────────────────────────────────────
@@ -87,7 +105,7 @@ JOUR_FULL  = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dima
 JOUR_CMD   = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
 
 def get_week_days(offset: int = 0) -> list[tuple[str, str]]:
-    today  = datetime.now()
+    today  = now()
     monday = today - timedelta(days=today.weekday()) + timedelta(weeks=offset)
     return [
         (JOUR_NOMS[i], (monday + timedelta(days=i)).strftime("%d/%m"))
@@ -106,7 +124,8 @@ def slot_is_past(date_str: str, slot: str) -> bool:
     try:
         day, month = map(int, date_str.split("/"))
         h, m       = map(int, slot.split(":"))
-        return datetime(datetime.now().year, month, day, h, m) < datetime.now()
+        slot_dt    = TZ.localize(datetime(now().year, month, day, h, m))
+        return slot_dt < now()
     except:
         return False
 
@@ -119,7 +138,7 @@ def parse_key(key: str) -> tuple[str, str]:
     return (parts[1] if len(parts) > 1 else ""), slot
 
 def today_weekday() -> int:
-    return datetime.now().weekday()  # 0=lundi
+    return now().weekday()  # 0=lundi
 
 # ─── Sécurité ─────────────────────────────────────────────────────────────────
 
@@ -166,7 +185,7 @@ def build_full_text(planning: dict, days: list) -> str:
             lines.append("")
     if not found:
         lines.append("_Aucune réservation — sélectionnez un jour ci-dessous._")
-    lines.append("_Mis à jour : " + datetime.now().strftime("%d/%m %H:%M") + "_")
+    lines.append("_Mis à jour : " + now().strftime("%d/%m %H:%M") + "_")
     return "\n".join(lines)
 
 def build_day_text(planning: dict, day_name: str, date_str: str,
@@ -182,7 +201,7 @@ def build_day_text(planning: dict, day_name: str, date_str: str,
     else:
         lines.append("_Aucune réservation pour ce jour._")
     lines.append("")
-    lines.append("_Mis à jour : " + datetime.now().strftime("%d/%m %H:%M") + "_")
+    lines.append("_Mis à jour : " + now().strftime("%d/%m %H:%M") + "_")
     return "\n".join(lines)
 
 def _day_slot_lines(planning: dict, day_name: str, date_str: str,
@@ -400,12 +419,13 @@ async def cmd_purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_admin(update): return
     planning = get_planning()
     removed  = 0
-    for key in list(planning.keys()):
-        date_str, slot = parse_key(key)
-        if slot_is_past(date_str, slot):
-            del planning[key]
-            removed += 1
-    save_data(db)
+    with db_lock:
+        for key in list(planning.keys()):
+            date_str, slot = parse_key(key)
+            if slot_is_past(date_str, slot):
+                del planning[key]
+                removed += 1
+        save_data(db)
     await update.message.reply_text(
         f"🗑 *{removed} créneau(x) passé(s) supprimé(s).*", parse_mode="Markdown"
     )
@@ -413,8 +433,9 @@ async def cmd_purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_group_only(update): return
     if not await check_admin(update): return
-    db["planning"] = {}
-    save_data(db)
+    with db_lock:
+        db["planning"] = {}
+        save_data(db)
     await update.message.reply_text("♻️ *Planning réinitialisé.*", parse_mode="Markdown")
 
 async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -553,18 +574,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         day_idx              = int(day_idx_str)
         day_name, date_str   = days[day_idx]
         key                  = make_key(day_name, date_str, slot)
-        members              = planning.setdefault(key, [])
 
-        if username in members:
-            members.remove(username)
-            if not members:
-                del planning[key]
-            await query.answer(f"❌ Désinscrit — {day_name} {date_str} {slot}")
-        else:
-            members.append(username)
-            await query.answer(f"✅ Inscrit — {day_name} {date_str} à {slot}")
+        with db_lock:
+            members = planning.setdefault(key, [])
+            if username in members:
+                members.remove(username)
+                if not members:
+                    del planning[key]
+                notif = f"❌ Désinscrit — {day_name} {date_str} {slot}"
+            else:
+                members.append(username)
+                notif = f"✅ Inscrit — {day_name} {date_str} à {slot}"
 
         save_data(db)
+        await query.answer(notif)
         await _edit(query, build_full_text(planning, days),
                     build_keyboard(planning, days, selected_day=day_idx))
 
@@ -573,10 +596,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⛔ Réservé aux administrateurs.", show_alert=True)
             return
         removed = 0
-        for key in list(planning.keys()):
-            date_str, slot = parse_key(key)
-            if slot_is_past(date_str, slot):
-                del planning[key]; removed += 1
+        with db_lock:
+            for key in list(planning.keys()):
+                date_str, slot = parse_key(key)
+                if slot_is_past(date_str, slot):
+                    del planning[key]; removed += 1
         save_data(db)
         await query.answer(f"🗑 {removed} créneau(x) passé(s) supprimé(s).")
         await _edit(query, build_full_text(planning, days),
