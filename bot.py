@@ -10,7 +10,7 @@ ScheduleBot Telegram v3.2
 ✅ Commandes membres : /planning /myslots /demain /semaine
 ✅ Protection concurrence JSON (threading.Lock)
 ✅ Auto-redémarrage sur erreur Conflict
-✅ màj conccurence et time zone
+✅ màj conccurence et time zone 
 """
 
 import os
