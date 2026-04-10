@@ -1,4 +1,4 @@
-"""
+""""
 ScheduleBot Telegram v3.2
 ─────────────────────────────────────────────
 ✅ Multi-admins (liste configurable)
