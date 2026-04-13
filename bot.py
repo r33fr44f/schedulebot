@@ -1,5 +1,5 @@
 """
-ScheduleBot Telegram v3.5
+ScheduleBot Telegram v3.5.1
 ─────────────────────────────────────────────
 ✅ Multi-admins (liste configurable)
 ✅ Réservation membres du groupe uniquement
@@ -16,54 +16,7 @@ ScheduleBot Telegram v3.5
 ✅ get_planning() dans les blocs db_lock (cohérence garantie)
 ✅ parse_key() robuste avec try/except + log
 ✅ Suppression de last_message_id inutilisée (double save supprimé)
-
-─────────────────────────────────────────────
-HISTORIQUE DES CORRECTIFS
-
-v3.1 → v3.2
-  - Ajout multi-admins (ADMIN_IDS liste CSV)
-  - Ajout /addadmin /removeadmin /admins
-  - Ajout vues par jour (/lundi … /dimanche, /aujourd_hui, /demain)
-  - Ajout /semaine (résumé compact)
-  - Protection concurrence JSON (threading.Lock)
-  - Auto-redémarrage sur erreur Conflict (boucle retry)
-  - Gestion timezone Europe/Paris via pytz
-
-v3.2 → v3.3
-  - threading.Lock → threading.RLock : évite le deadlock quand save_data()
-    (qui acquiert db_lock) est appelé depuis un bloc `with db_lock`
-  - Suppression du query.answer() global dans on_callback : chaque branche
-    appelle son propre query.answer() pour que la notification d'appui soit
-    bien affichée (Telegram n'autorise qu'une réponse par callback)
-  - save_data() déplacé à l'intérieur des blocs `with db_lock` pour garantir
-    l'atomicité écriture mémoire + écriture disque (SLOT, PURGE, cmd_purge,
-    cmd_reset)
-
-v3.3 → v3.4
-  - Correction bug année dans slot_is_past() : l'année était toujours
-    now().year, ce qui faisait considérer les créneaux de janvier comme
-    "passés" si le planning avait été créé en décembre.
-    → L'année est désormais stockée dans les clés au format "JJ/MM/AAAA"
-      (ex : "Lun 03/01/2026|09:00") et parsée proprement dans slot_is_past().
-    → Migration automatique des anciennes clés "JJ/MM" au démarrage
-      (fonction migrate_keys).
-    → L'affichage reste compact "JJ/MM" (l'année est masquée dans les textes
-      et boutons pour ne pas surcharger l'interface).
-  - Ajout de logs explicites dans tous les blocs except qui étaient
-    silencieux (is_group_member, slot_is_past, cmd_admins, _edit, load_data,
-    save_data, boucle retry principale) pour faciliter le diagnostic en prod.
-
-v3.4 → v3.5
-  - Cohérence lecture planning sous lock : get_planning() est désormais
-    appelé à l'intérieur des blocs `with db_lock` dans cmd_purge et
-    on_callback (SLOT, PURGE) pour garantir qu'on travaille toujours sur
-    la version la plus récente du dict (ex : après un /reset concurrent).
-  - parse_key() rendu robuste : ajout d'un try/except + log explicite pour
-    éviter qu'une clé malformée ("|" absent, label incomplet) ne fasse
-    planter silencieusement slot_is_past() avec une date_str vide.
-  - Suppression de last_message_id dans cmd_new : la variable n'était jamais
-    lue ailleurs dans le code — les deux lignes (affectation + double
-    save_data) ont été retirées pour éviter une écriture JSON superflue.
+✅ Échappement Markdown des prénoms (correction erreur "Can't parse entities")
 ─────────────────────────────────────────────
 """
 
@@ -82,6 +35,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 from telegram.error import TelegramError
+from telegram.helpers import escape_markdown  # <-- AJOUT v3.5.1
 
 # ─── Timezone ─────────────────────────────────────────────────────────────────
 TZ = pytz.timezone("Europe/Paris")
@@ -91,10 +45,6 @@ def now() -> datetime:
     return datetime.now(TZ)
 
 # ─── Lock global (RLock réentrant) ────────────────────────────────────────────
-# RLock permet au même thread d'acquérir le lock plusieurs fois sans deadlock
-# (ex : with db_lock → save_data() qui refait with db_lock).
-# Deux threads différents sont toujours bloqués l'un par l'autre : la
-# protection anti-concurrence est strictement identique à Lock.
 db_lock = RLock()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -102,8 +52,6 @@ db_lock = RLock()
 TOKEN    = os.environ.get("BOT_TOKEN", "")
 GROUP_ID = int(os.environ.get("GROUP_ID", "0"))
 
-# ADMIN_IDS : liste d'IDs séparés par des virgules dans la variable d'env
-# ex: ADMIN_IDS=12345678,87654321
 _raw_admins = os.environ.get("ADMIN_IDS", os.environ.get("ADMIN_ID", "0"))
 INITIAL_ADMIN_IDS: set[int] = {
     int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()
@@ -140,8 +88,6 @@ def save_data(db: dict):
 db: dict = load_data()
 
 # ─── Migration des anciennes clés (v3.3 → v3.4) ───────────────────────────────
-# Les clés passaient de "Lun 03/01|09:00" à "Lun 03/01/2026|09:00".
-# Cette fonction convertit automatiquement un planning.json existant.
 
 def migrate_keys():
     planning = db.get("planning")
@@ -157,7 +103,6 @@ def migrate_keys():
                 if len(parts) < 2:
                     continue
                 day_name, date_str = parts[0], parts[1]
-                # Ancienne clé : date_str = "JJ/MM" (1 seul slash)
                 if date_str.count("/") == 1:
                     new_date = f"{date_str}/{current_year}"
                     new_key  = f"{day_name} {new_date}|{slot}"
@@ -198,7 +143,6 @@ def get_week_days(offset: int = 0) -> list[tuple[str, str]]:
     today  = now()
     monday = today - timedelta(days=today.weekday()) + timedelta(weeks=offset)
     return [
-        # Format JJ/MM/AAAA — l'année est incluse dans la clé depuis v3.4
         (JOUR_NOMS[i], (monday + timedelta(days=i)).strftime("%d/%m/%Y"))
         for i in range(7)
     ]
@@ -212,21 +156,15 @@ def get_slots() -> list[str]:
     return slots
 
 def slot_is_past(date_str: str, slot: str) -> bool:
-    """
-    Détermine si un créneau est passé.
-    date_str doit être au format JJ/MM/AAAA (ex: "03/01/2026").
-    L'année est parsée depuis la clé pour éviter le bug de fin d'année.
-    """
     try:
         parts = date_str.split("/")
         if len(parts) == 3:
             day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
         else:
-            # Fallback pour toute clé non migrée (ne devrait plus arriver)
             day, month = int(parts[0]), int(parts[1])
             year = now().year
             log.warning(f"slot_is_past : date sans année '{date_str}', fallback year={year}")
-        h, m    = map(int, slot.split(":"))
+        h, m = map(int, slot.split(":"))
         slot_dt = TZ.localize(datetime(year, month, day, h, m))
         return slot_dt < now()
     except Exception as e:
@@ -234,11 +172,6 @@ def slot_is_past(date_str: str, slot: str) -> bool:
         return False
 
 def parse_key(key: str) -> tuple[str, str]:
-    """
-    Retourne (date_str, slot) depuis une clé.
-    Robuste : retourne ("", "") et logue si la clé est malformée,
-    plutôt que de lever une exception qui ferait planter l'appelant.
-    """
     try:
         label, slot = key.split("|", 1)
         parts = label.split(" ")
@@ -254,7 +187,12 @@ def make_key(day_name: str, date_str: str, slot: str) -> str:
     return f"{day_name} {date_str}|{slot}"
 
 def today_weekday() -> int:
-    return now().weekday()  # 0=lundi
+    return now().weekday()
+
+# ─── Échappement Markdown (v3.5.1) ────────────────────────────────────────────
+def escape_md(text: str) -> str:
+    """Échappe les caractères réservés MarkdownV2 dans une chaîne."""
+    return escape_markdown(text, version=2)
 
 # ─── Sécurité ─────────────────────────────────────────────────────────────────
 
@@ -300,7 +238,7 @@ def build_full_text(planning: dict, days: list) -> str:
         day_lines = _day_slot_lines(planning, day_name, date_str)
         if day_lines:
             found = True
-            display = date_str[:5]  # affichage compact "JJ/MM"
+            display = date_str[:5]
             lines.append(f"📌 *{day_name} {display}*")
             lines.extend(day_lines)
             lines.append("")
@@ -312,7 +250,7 @@ def build_full_text(planning: dict, days: list) -> str:
 def build_day_text(planning: dict, day_name: str, date_str: str,
                    day_full: str, is_today: bool = False) -> str:
     tag     = " — *Aujourd'hui*" if is_today else ""
-    display = date_str[:5]  # affichage compact "JJ/MM"
+    display = date_str[:5]
     lines   = [
         f"📅 *{day_full} {display}*{tag}",
         "━" * 30, ""
@@ -328,19 +266,21 @@ def build_day_text(planning: dict, day_name: str, date_str: str,
 
 def _day_slot_lines(planning: dict, day_name: str, date_str: str,
                     show_empty: bool = False) -> list[str]:
+    """Affiche les créneaux d'un jour en échappant les noms des réservations."""
     lines = []
     for slot in get_slots():
-        key     = make_key(day_name, date_str, slot)
+        key = make_key(day_name, date_str, slot)
         members = planning.get(key, [])
         if members:
-            past  = "🕐 " if slot_is_past(date_str, slot) else "🟢 "
-            lines.append(f"  {past}`{slot}` → {', '.join(members)}")
+            past = "🕐 " if slot_is_past(date_str, slot) else "🟢 "
+            # Échappement Markdown des noms (v3.5.1)
+            members_escaped = [escape_md(m) for m in members]
+            lines.append(f"  {past}`{slot}` → {', '.join(members_escaped)}")
         elif show_empty:
             lines.append(f"  ⬜ `{slot}`")
     return lines
 
 def build_week_summary(planning: dict, days: list) -> str:
-    """Résumé compact de toute la semaine."""
     lines = ["📋 *RÉSUMÉ COMPLET DE LA SEMAINE*\n"]
     found = False
     for day_name, date_str in days:
@@ -360,49 +300,45 @@ def build_week_summary(planning: dict, days: list) -> str:
 def build_keyboard(planning: dict, days: list,
                    selected_day: int = None) -> InlineKeyboardMarkup:
     kb = []
-
-    # Ligne des jours — 4 puis 3
     day_row = []
     for i, (day_name, date_str) in enumerate(days):
-        count   = sum(len(v) for k, v in planning.items()
-                      if k.startswith(f"{day_name} {date_str}|"))
-        marker  = "▸ " if i == selected_day else ""
-        badge   = f"({count})" if count else ""
-        display = date_str[:5]  # affichage compact "JJ/MM" sur le bouton
-        label   = f"{marker}{day_name} {display} {badge}".strip()
+        count = sum(len(v) for k, v in planning.items()
+                    if k.startswith(f"{day_name} {date_str}|"))
+        marker = "▸ " if i == selected_day else ""
+        badge = f"({count})" if count else ""
+        display = date_str[:5]
+        label = f"{marker}{day_name} {display} {badge}".strip()
         day_row.append(InlineKeyboardButton(label, callback_data=f"DAY:{i}"))
         if len(day_row) == 4:
-            kb.append(day_row); day_row = []
+            kb.append(day_row)
+            day_row = []
     if day_row:
         kb.append(day_row)
 
-    # Créneaux du jour sélectionné
     if selected_day is not None:
         day_name, date_str = days[selected_day]
         display = date_str[:5]
-        kb.append([InlineKeyboardButton(
-            f"── {day_name} {display} ──", callback_data="NOOP"
-        )])
+        kb.append([InlineKeyboardButton(f"── {day_name} {display} ──", callback_data="NOOP")])
         row = []
         for slot in get_slots():
-            key     = make_key(day_name, date_str, slot)
+            key = make_key(day_name, date_str, slot)
             members = planning.get(key, [])
-            past    = slot_is_past(date_str, slot)
-            icon    = "🕐" if past and members else ("✅" if members else "")
-            count   = f" {len(members)}" if members else ""
+            past = slot_is_past(date_str, slot)
+            icon = "🕐" if past and members else ("✅" if members else "")
+            count = f" {len(members)}" if members else ""
             row.append(InlineKeyboardButton(
                 f"{icon}{slot}{count}", callback_data=f"SLOT:{selected_day}:{slot}"
             ))
             if len(row) == 3:
-                kb.append(row); row = []
+                kb.append(row)
+                row = []
         if row:
             kb.append(row)
         kb.append([InlineKeyboardButton("◀ Retour", callback_data="BACK")])
 
-    # Actions
     kb.append([
         InlineKeyboardButton("🗑 Purger passés", callback_data="PURGE"),
-        InlineKeyboardButton("📋 Résumé",         callback_data="SUMMARY"),
+        InlineKeyboardButton("📋 Résumé", callback_data="SUMMARY"),
     ])
     return InlineKeyboardMarkup(kb)
 
@@ -436,7 +372,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_planning(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_group_only(update): return
     planning = get_planning()
-    days     = get_week_days(get_week_offset())
+    days = get_week_days(get_week_offset())
     await update.message.reply_text(
         build_full_text(planning, days),
         parse_mode="Markdown",
@@ -446,7 +382,7 @@ async def cmd_planning(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_semaine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_group_only(update): return
     planning = get_planning()
-    days     = get_week_days(get_week_offset())
+    days = get_week_days(get_week_offset())
     await update.message.reply_text(
         build_week_summary(planning, days),
         parse_mode="Markdown"
@@ -456,16 +392,18 @@ async def cmd_myslots(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_group_only(update): return
     user = update.effective_user
     if is_bot_user(user): return
-    name     = user.first_name or user.username or "Anonyme"
+    name = user.first_name or user.username or "Anonyme"
+    # Échappement Markdown du nom (v3.5.1)
+    escaped_name = escape_md(name)
     planning = get_planning()
-    days     = get_week_days(get_week_offset())
-    lines    = [f"📋 *Vos réservations, {name}*\n"]
-    found    = False
+    days = get_week_days(get_week_offset())
+    lines = [f"📋 *Vos réservations, {escaped_name}*\n"]
+    found = False
     for day_name, date_str in days:
         for slot in get_slots():
             key = make_key(day_name, date_str, slot)
-            if name in planning.get(key, []):
-                past    = " 🕐_(passé)_" if slot_is_past(date_str, slot) else ""
+            if name in planning.get(key, []):  # comparer avec le nom original (non échappé)
+                past = " 🕐_(passé)_" if slot_is_past(date_str, slot) else ""
                 display = date_str[:5]
                 lines.append(f"• *{day_name} {display}* à `{slot}`{past}")
                 found = True
@@ -477,13 +415,12 @@ async def cmd_myslots(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _send_day_view(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          target_weekday: int):
-    """Envoie la vue d'un jour spécifique (0=lundi … 6=dimanche)."""
     if not await check_group_only(update): return
-    planning           = get_planning()
-    days               = get_week_days(get_week_offset())
+    planning = get_planning()
+    days = get_week_days(get_week_offset())
     day_name, date_str = days[target_weekday]
-    day_full           = JOUR_FULL[target_weekday]
-    is_today           = (target_weekday == today_weekday())
+    day_full = JOUR_FULL[target_weekday]
+    is_today = (target_weekday == today_weekday())
     await update.message.reply_text(
         build_day_text(planning, day_name, date_str, day_full, is_today),
         parse_mode="Markdown"
@@ -525,13 +462,11 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0] in ("+1", "+2", "-1"):
         offset = int(context.args[0])
     with db_lock:
-        db["planning"]    = {}
+        db["planning"] = {}
         db["week_offset"] = offset
         save_data(db)
-    days     = get_week_days(offset)
+    days = get_week_days(offset)
     planning = {}
-    # last_message_id supprimé (v3.5) : variable jamais lue ailleurs,
-    # évite un double save_data() inutile.
     await update.message.reply_text(
         "✅ *Nouveau planning créé !*\n\n" + build_full_text(planning, days),
         parse_mode="Markdown",
@@ -544,8 +479,6 @@ async def cmd_purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_admin(update): return
     removed = 0
     with db_lock:
-        # get_planning() à l'intérieur du lock (v3.5) : garantit qu'on
-        # travaille sur la version la plus récente après un éventuel /reset.
         planning = get_planning()
         for key in list(planning.keys()):
             date_str, slot = parse_key(key)
@@ -568,12 +501,12 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_group_only(update): return
     if not await check_admin(update): return
-    ids   = get_admin_ids()
+    ids = get_admin_ids()
     lines = [f"🔧 *Administrateurs du bot* ({len(ids)})\n"]
     for uid in ids:
         try:
             member = await context.bot.get_chat_member(GROUP_ID, uid)
-            name   = member.user.first_name or member.user.username or str(uid)
+            name = member.user.first_name or member.user.username or str(uid)
         except TelegramError as e:
             log.warning(f"cmd_admins : impossible de récupérer l'utilisateur {uid} : {e}")
             name = str(uid)
@@ -587,16 +520,16 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_group_only(update): return
     if not await check_admin(update): return
 
-    target_id   = None
+    target_id = None
     target_name = None
 
     if update.message.reply_to_message:
-        target_id   = update.message.reply_to_message.from_user.id
+        target_id = update.message.reply_to_message.from_user.id
         target_name = update.message.reply_to_message.from_user.first_name
     elif context.args:
         arg = context.args[0].lstrip("@")
         if arg.isdigit():
-            target_id   = int(arg)
+            target_id = int(arg)
             target_name = arg
         else:
             await update.message.reply_text(
@@ -628,16 +561,16 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_group_only(update): return
     if not await check_admin(update): return
 
-    target_id   = None
+    target_id = None
     target_name = None
 
     if update.message.reply_to_message:
-        target_id   = update.message.reply_to_message.from_user.id
+        target_id = update.message.reply_to_message.from_user.id
         target_name = update.message.reply_to_message.from_user.first_name
     elif context.args:
         arg = context.args[0].lstrip("@")
         if arg.isdigit():
-            target_id   = int(arg)
+            target_id = int(arg)
             target_name = arg
 
     if not target_id:
@@ -669,7 +602,7 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user  = query.from_user
+    user = query.from_user
 
     if is_bot_user(user):
         await query.answer("⛔ Les bots ne peuvent pas réserver.", show_alert=True)
@@ -680,17 +613,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⛔ Vous devez être membre du groupe.", show_alert=True)
         return
 
-    # NOTE : pas de query.answer() global ici.
-    # Chaque branche appelle son propre query.answer() pour que la notification
-    # soit bien affichée (Telegram n'autorise qu'une réponse par callback).
-
-    action   = query.data
+    action = query.data
     username = user.first_name or user.username or f"User{user.id}"
-    days     = get_week_days(get_week_offset())
-
-    # Pour les lectures simples (DAY, BACK, SUMMARY), on lit planning hors lock.
-    # Pour les écritures (SLOT, PURGE), planning est relu dans le bloc with db_lock.
-    planning = get_planning()
+    days = get_week_days(get_week_offset())
+    planning = get_planning()  # lecture hors lock (affichage seulement)
 
     if action == "NOOP":
         await query.answer()
@@ -708,15 +634,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action.startswith("SLOT:"):
         _, day_idx_str, slot = action.split(":", 2)
-        day_idx              = int(day_idx_str)
-        day_name, date_str   = days[day_idx]
-        key                  = make_key(day_name, date_str, slot)
+        day_idx = int(day_idx_str)
+        day_name, date_str = days[day_idx]
+        key = make_key(day_name, date_str, slot)
 
         with db_lock:
-            # Relecture sous lock (v3.5) : garantit la version la plus récente
-            # du planning (ex : après un /reset concurrent).
+            # Relecture sous lock pour garantir la version la plus récente
             planning = get_planning()
-            members  = planning.setdefault(key, [])
+            members = planning.setdefault(key, [])
             if username in members:
                 members.remove(username)
                 if not members:
@@ -725,7 +650,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 members.append(username)
                 notif = f"✅ Inscrit — {day_name} {date_str[:5]} à {slot}"
-            save_data(db)  # atomique : dans le même bloc verrouillé (RLock)
+            save_data(db)
 
         await query.answer(notif)
         await _edit(query, build_full_text(planning, days),
@@ -737,14 +662,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         removed = 0
         with db_lock:
-            # Relecture sous lock (v3.5) : même raison que SLOT ci-dessus.
             planning = get_planning()
             for key in list(planning.keys()):
                 date_str, slot = parse_key(key)
                 if date_str and slot_is_past(date_str, slot):
                     del planning[key]
                     removed += 1
-            save_data(db)  # atomique : dans le même bloc verrouillé (RLock)
+            save_data(db)
 
         await query.answer(f"🗑 {removed} créneau(x) passé(s) supprimé(s).")
         await _edit(query, build_full_text(planning, days),
@@ -779,38 +703,34 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # Membres
-    app.add_handler(CommandHandler(["start", "help"],      cmd_start))
-    app.add_handler(CommandHandler("planning",             cmd_planning))
-    app.add_handler(CommandHandler("semaine",              cmd_semaine))
-    app.add_handler(CommandHandler("myslots",              cmd_myslots))
+    app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("planning", cmd_planning))
+    app.add_handler(CommandHandler("semaine", cmd_semaine))
+    app.add_handler(CommandHandler("myslots", cmd_myslots))
 
-    # Vues par jour
     app.add_handler(CommandHandler(
         ["aujourd_hui", "aujourdhui", "auj"],
         cmd_aujourd_hui
     ))
-    app.add_handler(CommandHandler("demain",               cmd_demain))
-    app.add_handler(CommandHandler("lundi",                cmd_lundi))
-    app.add_handler(CommandHandler("mardi",                cmd_mardi))
-    app.add_handler(CommandHandler("mercredi",             cmd_mercredi))
-    app.add_handler(CommandHandler("jeudi",                cmd_jeudi))
-    app.add_handler(CommandHandler("vendredi",             cmd_vendredi))
-    app.add_handler(CommandHandler("samedi",               cmd_samedi))
-    app.add_handler(CommandHandler("dimanche",             cmd_dimanche))
+    app.add_handler(CommandHandler("demain", cmd_demain))
+    app.add_handler(CommandHandler("lundi", cmd_lundi))
+    app.add_handler(CommandHandler("mardi", cmd_mardi))
+    app.add_handler(CommandHandler("mercredi", cmd_mercredi))
+    app.add_handler(CommandHandler("jeudi", cmd_jeudi))
+    app.add_handler(CommandHandler("vendredi", cmd_vendredi))
+    app.add_handler(CommandHandler("samedi", cmd_samedi))
+    app.add_handler(CommandHandler("dimanche", cmd_dimanche))
 
-    # Admin
-    app.add_handler(CommandHandler("new",                  cmd_new))
-    app.add_handler(CommandHandler("purge",                cmd_purge))
-    app.add_handler(CommandHandler("reset",                cmd_reset))
-    app.add_handler(CommandHandler("admins",               cmd_admins))
-    app.add_handler(CommandHandler("addadmin",             cmd_addadmin))
-    app.add_handler(CommandHandler("removeadmin",          cmd_removeadmin))
+    app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("purge", cmd_purge))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("admins", cmd_admins))
+    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
+    app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
 
-    # Boutons inline
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    log.info(f"✅ ScheduleBot v3.5 démarré — admins initiaux : {INITIAL_ADMIN_IDS}")
+    log.info(f"✅ ScheduleBot v3.5.1 démarré — admins initiaux : {INITIAL_ADMIN_IDS}")
     app.run_polling(drop_pending_updates=True, close_loop=False)
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -819,7 +739,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
     def log_message(self, format, *args):
-        pass  # silence les logs HTTP
+        pass
 
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
@@ -832,7 +752,6 @@ if __name__ == "__main__":
     import time
     from telegram.error import Conflict as TGConflict
 
-    # Démarrer le serveur HTTP EN PREMIER
     t = threading.Thread(target=start_health_server, daemon=True)
     t.start()
     time.sleep(2)
