@@ -1,5 +1,5 @@
-""""
-ScheduleBot Telegram v3.2
+"""
+ScheduleBot Telegram v3.5
 ─────────────────────────────────────────────
 ✅ Multi-admins (liste configurable)
 ✅ Réservation membres du groupe uniquement
@@ -8,16 +8,70 @@ ScheduleBot Telegram v3.2
 ✅ Vues par jour : /aujourd_hui /demain /lundi … /dimanche
 ✅ Commandes admin : /new /purge /reset /addadmin /removeadmin /admins
 ✅ Commandes membres : /planning /myslots /demain /semaine
-✅ Protection concurrence JSON (threading.Lock)
+✅ Protection concurrence JSON (threading.RLock — réentrant, anti-deadlock)
 ✅ Auto-redémarrage sur erreur Conflict
-✅ màj conccurence et time zone 
+✅ Gestion timezone Europe/Paris (heure été/hiver auto)
+✅ Année stockée dans les clés (format JJ/MM/AAAA) — anti-bug 31 déc
+✅ Logs sur tous les blocs except (plus d'erreurs silencieuses)
+✅ get_planning() dans les blocs db_lock (cohérence garantie)
+✅ parse_key() robuste avec try/except + log
+✅ Suppression de last_message_id inutilisée (double save supprimé)
+
+─────────────────────────────────────────────
+HISTORIQUE DES CORRECTIFS
+
+v3.1 → v3.2
+  - Ajout multi-admins (ADMIN_IDS liste CSV)
+  - Ajout /addadmin /removeadmin /admins
+  - Ajout vues par jour (/lundi … /dimanche, /aujourd_hui, /demain)
+  - Ajout /semaine (résumé compact)
+  - Protection concurrence JSON (threading.Lock)
+  - Auto-redémarrage sur erreur Conflict (boucle retry)
+  - Gestion timezone Europe/Paris via pytz
+
+v3.2 → v3.3
+  - threading.Lock → threading.RLock : évite le deadlock quand save_data()
+    (qui acquiert db_lock) est appelé depuis un bloc `with db_lock`
+  - Suppression du query.answer() global dans on_callback : chaque branche
+    appelle son propre query.answer() pour que la notification d'appui soit
+    bien affichée (Telegram n'autorise qu'une réponse par callback)
+  - save_data() déplacé à l'intérieur des blocs `with db_lock` pour garantir
+    l'atomicité écriture mémoire + écriture disque (SLOT, PURGE, cmd_purge,
+    cmd_reset)
+
+v3.3 → v3.4
+  - Correction bug année dans slot_is_past() : l'année était toujours
+    now().year, ce qui faisait considérer les créneaux de janvier comme
+    "passés" si le planning avait été créé en décembre.
+    → L'année est désormais stockée dans les clés au format "JJ/MM/AAAA"
+      (ex : "Lun 03/01/2026|09:00") et parsée proprement dans slot_is_past().
+    → Migration automatique des anciennes clés "JJ/MM" au démarrage
+      (fonction migrate_keys).
+    → L'affichage reste compact "JJ/MM" (l'année est masquée dans les textes
+      et boutons pour ne pas surcharger l'interface).
+  - Ajout de logs explicites dans tous les blocs except qui étaient
+    silencieux (is_group_member, slot_is_past, cmd_admins, _edit, load_data,
+    save_data, boucle retry principale) pour faciliter le diagnostic en prod.
+
+v3.4 → v3.5
+  - Cohérence lecture planning sous lock : get_planning() est désormais
+    appelé à l'intérieur des blocs `with db_lock` dans cmd_purge et
+    on_callback (SLOT, PURGE) pour garantir qu'on travaille toujours sur
+    la version la plus récente du dict (ex : après un /reset concurrent).
+  - parse_key() rendu robuste : ajout d'un try/except + log explicite pour
+    éviter qu'une clé malformée ("|" absent, label incomplet) ne fasse
+    planter silencieusement slot_is_past() avec une date_str vide.
+  - Suppression de last_message_id dans cmd_new : la variable n'était jamais
+    lue ailleurs dans le code — les deux lignes (affectation + double
+    save_data) ont été retirées pour éviter une écriture JSON superflue.
+─────────────────────────────────────────────
 """
 
 import os
 import json
 import logging
 import threading
-from threading import Lock
+from threading import RLock
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -33,11 +87,15 @@ from telegram.error import TelegramError
 TZ = pytz.timezone("Europe/Paris")
 
 def now() -> datetime:
-    """Heure actuelle en heure française (gère heure d été / hiver auto)."""
+    """Heure actuelle en heure française (gère heure d'été / hiver auto)."""
     return datetime.now(TZ)
 
-# ─── Lock global (protection concurrence JSON) ───────────────────────────────
-db_lock = Lock()
+# ─── Lock global (RLock réentrant) ────────────────────────────────────────────
+# RLock permet au même thread d'acquérir le lock plusieurs fois sans deadlock
+# (ex : with db_lock → save_data() qui refait with db_lock).
+# Deux threads différents sont toujours bloqués l'un par l'autre : la
+# protection anti-concurrence est strictement identique à Lock.
+db_lock = RLock()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -68,7 +126,7 @@ def load_data() -> dict:
                 with open(DATA_FILE, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception as e:
-                log.error(f"Erreur lecture : {e}")
+                log.error(f"Erreur lecture JSON ({DATA_FILE}) : {e}")
         return {}
 
 def save_data(db: dict):
@@ -77,9 +135,41 @@ def save_data(db: dict):
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 json.dump(db, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            log.error(f"Erreur sauvegarde : {e}")
+            log.error(f"Erreur sauvegarde JSON ({DATA_FILE}) : {e}")
 
 db: dict = load_data()
+
+# ─── Migration des anciennes clés (v3.3 → v3.4) ───────────────────────────────
+# Les clés passaient de "Lun 03/01|09:00" à "Lun 03/01/2026|09:00".
+# Cette fonction convertit automatiquement un planning.json existant.
+
+def migrate_keys():
+    planning = db.get("planning")
+    if not planning:
+        return
+    current_year = now().year
+    migrated = 0
+    with db_lock:
+        for old_key in list(planning.keys()):
+            try:
+                label, slot = old_key.split("|", 1)
+                parts = label.split(" ")
+                if len(parts) < 2:
+                    continue
+                day_name, date_str = parts[0], parts[1]
+                # Ancienne clé : date_str = "JJ/MM" (1 seul slash)
+                if date_str.count("/") == 1:
+                    new_date = f"{date_str}/{current_year}"
+                    new_key  = f"{day_name} {new_date}|{slot}"
+                    planning[new_key] = planning.pop(old_key)
+                    migrated += 1
+            except Exception as e:
+                log.warning(f"migrate_keys : impossible de migrer '{old_key}' : {e}")
+        if migrated:
+            save_data(db)
+            log.info(f"Migration v3.4 : {migrated} clé(s) converties au format JJ/MM/AAAA.")
+
+migrate_keys()
 
 # ─── Helpers DB ───────────────────────────────────────────────────────────────
 
@@ -108,7 +198,8 @@ def get_week_days(offset: int = 0) -> list[tuple[str, str]]:
     today  = now()
     monday = today - timedelta(days=today.weekday()) + timedelta(weeks=offset)
     return [
-        (JOUR_NOMS[i], (monday + timedelta(days=i)).strftime("%d/%m"))
+        # Format JJ/MM/AAAA — l'année est incluse dans la clé depuis v3.4
+        (JOUR_NOMS[i], (monday + timedelta(days=i)).strftime("%d/%m/%Y"))
         for i in range(7)
     ]
 
@@ -121,21 +212,46 @@ def get_slots() -> list[str]:
     return slots
 
 def slot_is_past(date_str: str, slot: str) -> bool:
+    """
+    Détermine si un créneau est passé.
+    date_str doit être au format JJ/MM/AAAA (ex: "03/01/2026").
+    L'année est parsée depuis la clé pour éviter le bug de fin d'année.
+    """
     try:
-        day, month = map(int, date_str.split("/"))
-        h, m       = map(int, slot.split(":"))
-        slot_dt    = TZ.localize(datetime(now().year, month, day, h, m))
+        parts = date_str.split("/")
+        if len(parts) == 3:
+            day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+        else:
+            # Fallback pour toute clé non migrée (ne devrait plus arriver)
+            day, month = int(parts[0]), int(parts[1])
+            year = now().year
+            log.warning(f"slot_is_past : date sans année '{date_str}', fallback year={year}")
+        h, m    = map(int, slot.split(":"))
+        slot_dt = TZ.localize(datetime(year, month, day, h, m))
         return slot_dt < now()
-    except:
+    except Exception as e:
+        log.warning(f"slot_is_past : impossible de parser date='{date_str}' slot='{slot}' : {e}")
         return False
+
+def parse_key(key: str) -> tuple[str, str]:
+    """
+    Retourne (date_str, slot) depuis une clé.
+    Robuste : retourne ("", "") et logue si la clé est malformée,
+    plutôt que de lever une exception qui ferait planter l'appelant.
+    """
+    try:
+        label, slot = key.split("|", 1)
+        parts = label.split(" ")
+        date_str = parts[1] if len(parts) > 1 else ""
+        if not date_str:
+            log.warning(f"parse_key : date_str vide pour la clé '{key}'")
+        return date_str, slot
+    except Exception as e:
+        log.error(f"parse_key : clé malformée '{key}' : {e}")
+        return "", ""
 
 def make_key(day_name: str, date_str: str, slot: str) -> str:
     return f"{day_name} {date_str}|{slot}"
-
-def parse_key(key: str) -> tuple[str, str]:
-    label, slot = key.split("|", 1)
-    parts = label.split(" ")
-    return (parts[1] if len(parts) > 1 else ""), slot
 
 def today_weekday() -> int:
     return now().weekday()  # 0=lundi
@@ -148,7 +264,11 @@ async def is_group_member(bot, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(GROUP_ID, user_id)
         return member.status in ("member", "administrator", "creator")
-    except TelegramError:
+    except TelegramError as e:
+        log.warning(f"is_group_member({user_id}) : erreur Telegram : {e}")
+        return False
+    except Exception as e:
+        log.error(f"is_group_member({user_id}) : erreur inattendue : {e}")
         return False
 
 def is_admin(user_id: int) -> bool:
@@ -180,7 +300,8 @@ def build_full_text(planning: dict, days: list) -> str:
         day_lines = _day_slot_lines(planning, day_name, date_str)
         if day_lines:
             found = True
-            lines.append(f"📌 *{day_name} {date_str}*")
+            display = date_str[:5]  # affichage compact "JJ/MM"
+            lines.append(f"📌 *{day_name} {display}*")
             lines.extend(day_lines)
             lines.append("")
     if not found:
@@ -190,9 +311,10 @@ def build_full_text(planning: dict, days: list) -> str:
 
 def build_day_text(planning: dict, day_name: str, date_str: str,
                    day_full: str, is_today: bool = False) -> str:
-    tag   = " — *Aujourd'hui*" if is_today else ""
-    lines = [
-        f"📅 *{day_full} {date_str}*{tag}",
+    tag     = " — *Aujourd'hui*" if is_today else ""
+    display = date_str[:5]  # affichage compact "JJ/MM"
+    lines   = [
+        f"📅 *{day_full} {display}*{tag}",
         "━" * 30, ""
     ]
     day_lines = _day_slot_lines(planning, day_name, date_str, show_empty=True)
@@ -225,7 +347,8 @@ def build_week_summary(planning: dict, days: list) -> str:
         day_lines = _day_slot_lines(planning, day_name, date_str)
         if day_lines:
             found = True
-            lines.append(f"📌 *{day_name} {date_str}*")
+            display = date_str[:5]
+            lines.append(f"📌 *{day_name} {display}*")
             lines.extend(day_lines)
             lines.append("")
     if not found:
@@ -241,11 +364,12 @@ def build_keyboard(planning: dict, days: list,
     # Ligne des jours — 4 puis 3
     day_row = []
     for i, (day_name, date_str) in enumerate(days):
-        count  = sum(len(v) for k, v in planning.items()
-                     if k.startswith(f"{day_name} {date_str}|"))
-        marker = "▸ " if i == selected_day else ""
-        badge  = f"({count})" if count else ""
-        label  = f"{marker}{day_name} {date_str} {badge}".strip()
+        count   = sum(len(v) for k, v in planning.items()
+                      if k.startswith(f"{day_name} {date_str}|"))
+        marker  = "▸ " if i == selected_day else ""
+        badge   = f"({count})" if count else ""
+        display = date_str[:5]  # affichage compact "JJ/MM" sur le bouton
+        label   = f"{marker}{day_name} {display} {badge}".strip()
         day_row.append(InlineKeyboardButton(label, callback_data=f"DAY:{i}"))
         if len(day_row) == 4:
             kb.append(day_row); day_row = []
@@ -255,8 +379,9 @@ def build_keyboard(planning: dict, days: list,
     # Créneaux du jour sélectionné
     if selected_day is not None:
         day_name, date_str = days[selected_day]
+        display = date_str[:5]
         kb.append([InlineKeyboardButton(
-            f"── {day_name} {date_str} ──", callback_data="NOOP"
+            f"── {day_name} {display} ──", callback_data="NOOP"
         )])
         row = []
         for slot in get_slots():
@@ -275,11 +400,10 @@ def build_keyboard(planning: dict, days: list,
         kb.append([InlineKeyboardButton("◀ Retour", callback_data="BACK")])
 
     # Actions
-    admin_row = [
-        InlineKeyboardButton("🗑 Purger passés",  callback_data="PURGE"),
-        InlineKeyboardButton("📋 Résumé",          callback_data="SUMMARY"),
-    ]
-    kb.append(admin_row)
+    kb.append([
+        InlineKeyboardButton("🗑 Purger passés", callback_data="PURGE"),
+        InlineKeyboardButton("📋 Résumé",         callback_data="SUMMARY"),
+    ])
     return InlineKeyboardMarkup(kb)
 
 # ─── Commandes membres ────────────────────────────────────────────────────────
@@ -341,8 +465,9 @@ async def cmd_myslots(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for slot in get_slots():
             key = make_key(day_name, date_str, slot)
             if name in planning.get(key, []):
-                past  = " 🕐_(passé)_" if slot_is_past(date_str, slot) else ""
-                lines.append(f"• *{day_name} {date_str}* à `{slot}`{past}")
+                past    = " 🕐_(passé)_" if slot_is_past(date_str, slot) else ""
+                display = date_str[:5]
+                lines.append(f"• *{day_name} {display}* à `{slot}`{past}")
                 found = True
     if not found:
         lines.append("_Aucune réservation cette semaine._")
@@ -354,12 +479,11 @@ async def _send_day_view(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          target_weekday: int):
     """Envoie la vue d'un jour spécifique (0=lundi … 6=dimanche)."""
     if not await check_group_only(update): return
-    planning  = get_planning()
-    offset    = get_week_offset()
-    days      = get_week_days(offset)
+    planning           = get_planning()
+    days               = get_week_days(get_week_offset())
     day_name, date_str = days[target_weekday]
-    day_full  = JOUR_FULL[target_weekday]
-    is_today  = (target_weekday == today_weekday())
+    day_full           = JOUR_FULL[target_weekday]
+    is_today           = (target_weekday == today_weekday())
     await update.message.reply_text(
         build_day_text(planning, day_name, date_str, day_full, is_today),
         parse_mode="Markdown"
@@ -400,29 +524,32 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     offset = 0
     if context.args and context.args[0] in ("+1", "+2", "-1"):
         offset = int(context.args[0])
-    db["planning"]    = {}
-    db["week_offset"] = offset
-    save_data(db)
+    with db_lock:
+        db["planning"]    = {}
+        db["week_offset"] = offset
+        save_data(db)
     days     = get_week_days(offset)
     planning = {}
-    msg = await update.message.reply_text(
+    # last_message_id supprimé (v3.5) : variable jamais lue ailleurs,
+    # évite un double save_data() inutile.
+    await update.message.reply_text(
         "✅ *Nouveau planning créé !*\n\n" + build_full_text(planning, days),
         parse_mode="Markdown",
         reply_markup=build_keyboard(planning, days)
     )
-    db["last_message_id"] = msg.message_id
-    save_data(db)
     log.info(f"Nouveau planning créé par {update.effective_user.id} (offset={offset})")
 
 async def cmd_purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_group_only(update): return
     if not await check_admin(update): return
-    planning = get_planning()
-    removed  = 0
+    removed = 0
     with db_lock:
+        # get_planning() à l'intérieur du lock (v3.5) : garantit qu'on
+        # travaille sur la version la plus récente après un éventuel /reset.
+        planning = get_planning()
         for key in list(planning.keys()):
             date_str, slot = parse_key(key)
-            if slot_is_past(date_str, slot):
+            if date_str and slot_is_past(date_str, slot):
                 del planning[key]
                 removed += 1
         save_data(db)
@@ -447,7 +574,11 @@ async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             member = await context.bot.get_chat_member(GROUP_ID, uid)
             name   = member.user.first_name or member.user.username or str(uid)
-        except:
+        except TelegramError as e:
+            log.warning(f"cmd_admins : impossible de récupérer l'utilisateur {uid} : {e}")
+            name = str(uid)
+        except Exception as e:
+            log.error(f"cmd_admins : erreur inattendue pour {uid} : {e}")
             name = str(uid)
         lines.append(f"• {name} `({uid})`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -456,7 +587,6 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_group_only(update): return
     if not await check_admin(update): return
 
-    # Accepte : /addadmin en réponse à un message OU /addadmin 12345678
     target_id   = None
     target_name = None
 
@@ -465,9 +595,8 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_name = update.message.reply_to_message.from_user.first_name
     elif context.args:
         arg = context.args[0].lstrip("@")
-        # Si c'est un ID numérique
         if arg.isdigit():
-            target_id = int(arg)
+            target_id   = int(arg)
             target_name = arg
         else:
             await update.message.reply_text(
@@ -485,7 +614,7 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ids = get_admin_ids()
     if target_id in ids:
-        await update.message.reply_text(f"ℹ️ Cet utilisateur est déjà admin.")
+        await update.message.reply_text("ℹ️ Cet utilisateur est déjà admin.")
         return
 
     ids.add(target_id)
@@ -508,7 +637,7 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif context.args:
         arg = context.args[0].lstrip("@")
         if arg.isdigit():
-            target_id = int(arg)
+            target_id   = int(arg)
             target_name = arg
 
     if not target_id:
@@ -518,9 +647,10 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Interdit de retirer un admin initial (hardcodé dans les variables d'env)
     if target_id in INITIAL_ADMIN_IDS:
-        await update.message.reply_text("⛔ Impossible de retirer un admin configuré dans les variables d'environnement.")
+        await update.message.reply_text(
+            "⛔ Impossible de retirer un admin configuré dans les variables d'environnement."
+        )
         return
 
     ids = get_admin_ids()
@@ -550,22 +680,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⛔ Vous devez être membre du groupe.", show_alert=True)
         return
 
-    await query.answer()
+    # NOTE : pas de query.answer() global ici.
+    # Chaque branche appelle son propre query.answer() pour que la notification
+    # soit bien affichée (Telegram n'autorise qu'une réponse par callback).
 
     action   = query.data
     username = user.first_name or user.username or f"User{user.id}"
-    planning = get_planning()
     days     = get_week_days(get_week_offset())
 
+    # Pour les lectures simples (DAY, BACK, SUMMARY), on lit planning hors lock.
+    # Pour les écritures (SLOT, PURGE), planning est relu dans le bloc with db_lock.
+    planning = get_planning()
+
     if action == "NOOP":
-        return
+        await query.answer()
 
     elif action.startswith("DAY:"):
-        day_idx  = int(action.split(":")[1])
+        await query.answer()
+        day_idx = int(action.split(":")[1])
         await _edit(query, build_full_text(planning, days),
                     build_keyboard(planning, days, selected_day=day_idx))
 
     elif action == "BACK":
+        await query.answer()
         await _edit(query, build_full_text(planning, days),
                     build_keyboard(planning, days))
 
@@ -576,17 +713,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key                  = make_key(day_name, date_str, slot)
 
         with db_lock:
-            members = planning.setdefault(key, [])
+            # Relecture sous lock (v3.5) : garantit la version la plus récente
+            # du planning (ex : après un /reset concurrent).
+            planning = get_planning()
+            members  = planning.setdefault(key, [])
             if username in members:
                 members.remove(username)
                 if not members:
                     del planning[key]
-                notif = f"❌ Désinscrit — {day_name} {date_str} {slot}"
+                notif = f"❌ Désinscrit — {day_name} {date_str[:5]} {slot}"
             else:
                 members.append(username)
-                notif = f"✅ Inscrit — {day_name} {date_str} à {slot}"
+                notif = f"✅ Inscrit — {day_name} {date_str[:5]} à {slot}"
+            save_data(db)  # atomique : dans le même bloc verrouillé (RLock)
 
-        save_data(db)
         await query.answer(notif)
         await _edit(query, build_full_text(planning, days),
                     build_keyboard(planning, days, selected_day=day_idx))
@@ -597,16 +737,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         removed = 0
         with db_lock:
+            # Relecture sous lock (v3.5) : même raison que SLOT ci-dessus.
+            planning = get_planning()
             for key in list(planning.keys()):
                 date_str, slot = parse_key(key)
-                if slot_is_past(date_str, slot):
-                    del planning[key]; removed += 1
-        save_data(db)
+                if date_str and slot_is_past(date_str, slot):
+                    del planning[key]
+                    removed += 1
+            save_data(db)  # atomique : dans le même bloc verrouillé (RLock)
+
         await query.answer(f"🗑 {removed} créneau(x) passé(s) supprimé(s).")
         await _edit(query, build_full_text(planning, days),
                     build_keyboard(planning, days))
 
     elif action == "SUMMARY":
+        await query.answer("Résumé envoyé !")
         try:
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
@@ -614,14 +759,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         except TelegramError as e:
-            log.error(f"Résumé : {e}")
-        await query.answer("Résumé envoyé !")
+            log.error(f"SUMMARY : erreur envoi message : {e}")
+        except Exception as e:
+            log.error(f"SUMMARY : erreur inattendue : {e}")
 
 async def _edit(query, text: str, keyboard: InlineKeyboardMarkup):
     try:
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
-    except TelegramError:
-        pass
+    except TelegramError as e:
+        log.warning(f"_edit : impossible de modifier le message : {e}")
+    except Exception as e:
+        log.error(f"_edit : erreur inattendue : {e}")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -662,7 +810,7 @@ def main():
     # Boutons inline
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    log.info(f"✅ ScheduleBot v3 démarré — admins initiaux : {INITIAL_ADMIN_IDS}")
+    log.info(f"✅ ScheduleBot v3.5 démarré — admins initiaux : {INITIAL_ADMIN_IDS}")
     app.run_polling(drop_pending_updates=True, close_loop=False)
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -699,11 +847,11 @@ if __name__ == "__main__":
         try:
             log.info(f"Tentative de démarrage #{retry + 1}...")
             main()
-            break  # Sortie propre, on arrête la boucle
+            break
 
         except TGConflict:
             retry += 1
-            wait = retry * 10  # 10s, 20s, 30s...
+            wait = retry * 10
             log.warning(
                 f"Conflit détecté (instance dupliquée). "
                 f"Attente {wait}s avant redémarrage... "
@@ -711,8 +859,8 @@ if __name__ == "__main__":
             )
             try:
                 loop.close()
-            except:
-                pass
+            except Exception as e:
+                log.warning(f"Fermeture loop (Conflict) : {e}")
             time.sleep(wait)
 
         except Exception as e:
@@ -721,8 +869,8 @@ if __name__ == "__main__":
             log.error(f"Erreur inattendue : {e}. Redémarrage dans {wait}s...")
             try:
                 loop.close()
-            except:
-                pass
+            except Exception as e2:
+                log.warning(f"Fermeture loop (Exception) : {e2}")
             time.sleep(wait)
 
         finally:
